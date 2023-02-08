@@ -2,15 +2,21 @@ package epaxos
 
 import (
 	"bloomfilter"
+	"bufio"
 	"dlog"
 	"encoding/binary"
 	"epaxosproto"
 	"fastrpc"
+	"fmt"
 	"genericsmr"
 	"genericsmrproto"
 	"io"
 	"log"
+	"masterproto"
 	"math"
+	"net"
+	"net/rpc"
+	"sort"
 	"state"
 	"sync"
 	"time"
@@ -21,7 +27,6 @@ const TRUE = uint8(1)
 const FALSE = uint8(0)
 const DS = 5
 const ADAPT_TIME_SEC = 10
-
 const MAX_BATCH = 1000
 
 const COMMIT_GRACE_PERIOD = 10 * 1e9 //10 seconds
@@ -38,6 +43,21 @@ const CHECKPOINT_PERIOD = 10000
 var cpMarker []state.Command
 var cpcounter = 0
 
+// Ticker to reset every msec
+const R_TIME = 50
+
+// Number of top keys to store in new map
+const NEW_SIZE = 5
+
+// Minimum number of keys to be present in old map
+const MIN_LENGTH = 10
+
+// KeyinHP for a key should be minimum these many times
+const keyHP_COUNT = 10
+
+// Threshold to remove from hot map: 40%
+const THRESHOLD = 0.4
+
 type Replica struct {
 	*genericsmr.Replica
 	prepareChan           chan fastrpc.Serializable
@@ -51,6 +71,8 @@ type Replica struct {
 	acceptReplyChan       chan fastrpc.Serializable
 	tryPreAcceptChan      chan fastrpc.Serializable
 	tryPreAcceptReplyChan chan fastrpc.Serializable
+	forwardChan           chan fastrpc.Serializable
+	forwardRPC            uint8
 	prepareRPC            uint8
 	prepareReplyRPC       uint8
 	preAcceptRPC          uint8
@@ -74,6 +96,10 @@ type Replica struct {
 	latestCPInstance      int32
 	clientMutex           *sync.Mutex // for synchronizing when sending replies to clients from multiple go-routines
 	instancesToRecover    chan *instanceId
+
+	keyHistory    map[state.Key]*keySeenHelper
+	HotKeyHistory map[state.Key]*hotKeySeenHelper
+	lockVariables *sync.Mutex
 }
 
 type Instance struct {
@@ -117,34 +143,62 @@ type LeaderBookkeeping struct {
 	possibleQuorum    []bool
 	tpaOKs            int
 }
+type keySeenHelper struct {
+	keyInHP       int32   //counter to keep track: how many times a key appeared in Handle Propose
+	keyInSlowPath int32   //counter to keep track: how many times a key appeared in slow path
+	prevServ      []int32 //keep track of what servers served that key
+}
+
+type hotKeySeenHelper struct {
+	keyInHP  int32
+	keyInSP  int32
+	hotCount int32
+	prevServ []int32
+}
+
+// -------- For getting Top N from old map --------
+type dataSlice []*keySeenHelper
+
+func (d dataSlice) Len() int {
+	return len(d)
+}
+func (d dataSlice) Swap(i, j int) {
+	d[i], d[j] = d[j], d[i]
+}
+func (d dataSlice) Less(i, j int) bool {
+	return d[i].keyInHP > d[j].keyInHP
+}
+
+// -------- For getting Top N from old map --------
 
 func NewReplica(id int, peerAddrList []string, thrifty bool, exec bool, dreply bool, beacon bool, durable bool) *Replica {
+	// kh := &keySeenHelper{0, 0, make([]int32, 1000)}
 	r := &Replica{
-		genericsmr.NewReplica(id, peerAddrList, thrifty, exec, dreply),
-		make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE),
-		make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE),
-		make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE),
-		make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE),
-		make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE),
-		make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE),
-		make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE*3),
-		make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE*3),
-		make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE*2),
-		make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE),
-		make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE),
-		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-		make([][]*Instance, len(peerAddrList)),
-		make([]int32, len(peerAddrList)),
-		[DS]int32{-1, -1, -1, -1, -1},
-		make([]int32, len(peerAddrList)),
-		nil,
-		make([]map[state.Key]int32, len(peerAddrList)),
-		make(map[state.Key]int32),
-		0,
-		0,
-		-1,
-		new(sync.Mutex),
-		make(chan *instanceId, genericsmr.CHAN_BUFFER_SIZE)}
+		Replica:               genericsmr.NewReplica(id, peerAddrList, thrifty, exec, dreply),
+		prepareChan:           make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE),
+		preAcceptChan:         make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE),
+		acceptChan:            make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE),
+		commitChan:            make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE),
+		commitShortChan:       make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE),
+		prepareReplyChan:      make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE),
+		preAcceptReplyChan:    make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE*3),
+		preAcceptOKChan:       make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE*3),
+		acceptReplyChan:       make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE*2),
+		tryPreAcceptChan:      make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE),
+		tryPreAcceptReplyChan: make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE),
+		forwardChan:           make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE),
+		InstanceSpace:         make([][]*Instance, len(peerAddrList)),
+		crtInstance:           make([]int32, len(peerAddrList)),
+		CommittedUpTo:         [DS]int32{-1, -1, -1, -1, -1},
+		ExecedUpTo:            make([]int32, len(peerAddrList)),
+		conflicts:             make([]map[state.Key]int32, len(peerAddrList)),
+		maxSeqPerKey:          make(map[state.Key]int32),
+		latestCPInstance:      -1,
+		clientMutex:           new(sync.Mutex),
+		instancesToRecover:    make(chan *instanceId, genericsmr.CHAN_BUFFER_SIZE),
+		keyHistory:            make(map[state.Key]*keySeenHelper),
+		HotKeyHistory:         make(map[state.Key]*hotKeySeenHelper),
+		lockVariables:         new(sync.Mutex)}
 
 	r.Beacon = beacon
 	r.Durable = durable
@@ -165,6 +219,7 @@ func NewReplica(id int, peerAddrList []string, thrifty bool, exec bool, dreply b
 	cpMarker = make([]state.Command, 0)
 
 	//register RPCs
+	r.forwardRPC = r.RegisterRPC(new(genericsmr.Propose), r.forwardChan)
 	r.prepareRPC = r.RegisterRPC(new(epaxosproto.Prepare), r.prepareChan)
 	r.prepareReplyRPC = r.RegisterRPC(new(epaxosproto.PrepareReply), r.prepareReplyChan)
 	r.preAcceptRPC = r.RegisterRPC(new(epaxosproto.PreAccept), r.preAcceptChan)
@@ -182,7 +237,7 @@ func NewReplica(id int, peerAddrList []string, thrifty bool, exec bool, dreply b
 	return r
 }
 
-//append a log entry to stable storage
+// append a log entry to stable storage
 func (r *Replica) recordInstanceMetadata(inst *Instance) {
 	if !r.Durable {
 		return
@@ -200,7 +255,7 @@ func (r *Replica) recordInstanceMetadata(inst *Instance) {
 	r.StableStore.Write(b[:])
 }
 
-//write a sequence of commands to stable storage
+// write a sequence of commands to stable storage
 func (r *Replica) recordCommands(cmds []state.Command) {
 	if !r.Durable {
 		return
@@ -214,7 +269,7 @@ func (r *Replica) recordCommands(cmds []state.Command) {
 	}
 }
 
-//sync with the stable store
+// sync with the stable store
 func (r *Replica) sync() {
 	if !r.Durable {
 		return
@@ -272,7 +327,7 @@ var conflicted, weird, slow, happy int
 func (r *Replica) run() {
 	r.ConnectToPeers()
 
-	dlog.Println("Waiting for client connections")
+	// dlog.Println("Waiting for client connections")
 
 	go r.WaitForClientConnections()
 
@@ -302,7 +357,11 @@ func (r *Replica) run() {
 		go r.stopAdapting()
 	}
 
+	// for every sec: get top 10 into new map and reset old
+	go r.tickerReset()
+
 	onOffProposeChan := r.ProposeChan
+	// fmt.Println("onOffProposeChan = ", onOffProposeChan)
 
 	for !r.Shutdown {
 
@@ -310,7 +369,8 @@ func (r *Replica) run() {
 
 		case propose := <-onOffProposeChan:
 			//got a Propose from a client
-			dlog.Printf("Proposal with op %d\n", propose.Command.Op)
+			// dlog.Printf("Proposal with op %d\n", propose.Command.Op)
+			//fmt.Printf("Inside propose channel to call handle propose")
 			r.handlePropose(propose)
 			//deactivate new proposals channel to prioritize the handling of other protocol messages,
 			//and to allow commands to accumulate for batching
@@ -319,86 +379,99 @@ func (r *Replica) run() {
 
 		case <-fastClockChan:
 			//activate new proposals channel
+			// fmt.Printf("Inside activate new proposals channel")
 			onOffProposeChan = r.ProposeChan
 			break
 
 		case prepareS := <-r.prepareChan:
 			prepare := prepareS.(*epaxosproto.Prepare)
 			//got a Prepare message
-			dlog.Printf("Received Prepare for instance %d.%d\n", prepare.Replica, prepare.Instance)
+			//fmt.Printf("got a prepare message")
+			// dlog.Printf("Received Prepare for instance %d.%d\n", prepare.Replica, prepare.Instance)
 			r.handlePrepare(prepare)
 			break
 
 		case preAcceptS := <-r.preAcceptChan:
 			preAccept := preAcceptS.(*epaxosproto.PreAccept)
 			//got a PreAccept message
-			dlog.Printf("Received PreAccept for instance %d.%d\n", preAccept.LeaderId, preAccept.Instance)
+			//fmt.Printf("got a PreAccept message")
+			// dlog.Printf("Received PreAccept for instance %d.%d\n", preAccept.LeaderId, preAccept.Instance)
 			r.handlePreAccept(preAccept)
 			break
 
 		case acceptS := <-r.acceptChan:
 			accept := acceptS.(*epaxosproto.Accept)
 			//got an Accept message
-			dlog.Printf("Received Accept for instance %d.%d\n", accept.LeaderId, accept.Instance)
+			//fmt.Printf("got an Accept message")
+			// dlog.Printf("Received Accept for instance %d.%d\n", accept.LeaderId, accept.Instance)
 			r.handleAccept(accept)
 			break
 
 		case commitS := <-r.commitChan:
 			commit := commitS.(*epaxosproto.Commit)
 			//got a Commit message
-			dlog.Printf("Received Commit for instance %d.%d\n", commit.LeaderId, commit.Instance)
+			//fmt.Printf("got a Commit message")
+			// dlog.Printf("Received Commit for instance %d.%d\n", commit.LeaderId, commit.Instance)
 			r.handleCommit(commit)
 			break
 
 		case commitS := <-r.commitShortChan:
 			commit := commitS.(*epaxosproto.CommitShort)
 			//got a Commit message
-			dlog.Printf("Received Commit for instance %d.%d\n", commit.LeaderId, commit.Instance)
+			//fmt.Printf("got a CommitShortChan message")
+			// dlog.Printf("Received Commit for instance %d.%d\n", commit.LeaderId, commit.Instance)
 			r.handleCommitShort(commit)
 			break
 
 		case prepareReplyS := <-r.prepareReplyChan:
 			prepareReply := prepareReplyS.(*epaxosproto.PrepareReply)
 			//got a Prepare reply
-			dlog.Printf("Received PrepareReply for instance %d.%d\n", prepareReply.Replica, prepareReply.Instance)
+			//fmt.Printf("got a PrepareReply message")
+			// dlog.Printf("Received PrepareReply for instance %d.%d\n", prepareReply.Replica, prepareReply.Instance)
 			r.handlePrepareReply(prepareReply)
 			break
 
 		case preAcceptReplyS := <-r.preAcceptReplyChan:
 			preAcceptReply := preAcceptReplyS.(*epaxosproto.PreAcceptReply)
 			//got a PreAccept reply
-			dlog.Printf("Received PreAcceptReply for instance %d.%d\n", preAcceptReply.Replica, preAcceptReply.Instance)
+			//fmt.Printf("got a preAcceptReply message")
+			// dlog.Printf("Received PreAcceptReply for instance %d.%d\n", preAcceptReply.Replica, preAcceptReply.Instance)
 			r.handlePreAcceptReply(preAcceptReply)
 			break
 
 		case preAcceptOKS := <-r.preAcceptOKChan:
 			preAcceptOK := preAcceptOKS.(*epaxosproto.PreAcceptOK)
 			//got a PreAccept reply
-			dlog.Printf("Received PreAcceptOK for instance %d.%d\n", r.Id, preAcceptOK.Instance)
+			//fmt.Printf("got a preAccept reply message")
+			// dlog.Printf("Received PreAcceptOK for instance %d.%d\n", r.Id, preAcceptOK.Instance)
 			r.handlePreAcceptOK(preAcceptOK)
 			break
 
 		case acceptReplyS := <-r.acceptReplyChan:
 			acceptReply := acceptReplyS.(*epaxosproto.AcceptReply)
 			//got an Accept reply
-			dlog.Printf("Received AcceptReply for instance %d.%d\n", acceptReply.Replica, acceptReply.Instance)
+			//fmt.Printf("got an AcceptReply message")
+			// dlog.Printf("Received AcceptReply for instance %d.%d\n", acceptReply.Replica, acceptReply.Instance)
 			r.handleAcceptReply(acceptReply)
 			break
 
 		case tryPreAcceptS := <-r.tryPreAcceptChan:
 			tryPreAccept := tryPreAcceptS.(*epaxosproto.TryPreAccept)
-			dlog.Printf("Received TryPreAccept for instance %d.%d\n", tryPreAccept.Replica, tryPreAccept.Instance)
+			//fmt.Printf("got a tryPreAcceptChan message")
+			// dlog.Printf("Received TryPreAccept for instance %d.%d\n", tryPreAccept.Replica, tryPreAccept.Instance)
 			r.handleTryPreAccept(tryPreAccept)
 			break
 
 		case tryPreAcceptReplyS := <-r.tryPreAcceptReplyChan:
 			tryPreAcceptReply := tryPreAcceptReplyS.(*epaxosproto.TryPreAcceptReply)
-			dlog.Printf("Received TryPreAcceptReply for instance %d.%d\n", tryPreAcceptReply.Replica, tryPreAcceptReply.Instance)
+			//fmt.Printf("got a tryPreAcceptReply message")
+			// dlog.Printf("Received TryPreAcceptReply for instance %d.%d\n", tryPreAcceptReply.Replica, tryPreAcceptReply.Instance)
 			r.handleTryPreAcceptReply(tryPreAcceptReply)
 			break
 
 		case beacon := <-r.BeaconChan:
-			dlog.Printf("Received Beacon from replica %d with timestamp %d\n", beacon.Rid, beacon.Timestamp)
+			//fmt.Printf("got a beacon from replica")
+			// dlog.Printf("Received Beacon from replica %d with timestamp %d\n", beacon.Rid, beacon.Timestamp)
 			r.ReplyBeacon(beacon)
 			break
 
@@ -513,6 +586,10 @@ func (r *Replica) replyAccept(replicaId int32, reply *epaxosproto.AcceptReply) {
 
 func (r *Replica) replyTryPreAccept(replicaId int32, reply *epaxosproto.TryPreAcceptReply) {
 	r.SendMsg(replicaId, r.tryPreAcceptReplyRPC, reply)
+}
+
+func (r *Replica) forward(replicaId int32, reply *genericsmr.Propose) {
+	r.SendMsg(replicaId, r.forwardRPC, reply)
 }
 
 func (r *Replica) bcastPrepare(replica int32, instance int32, ballot int32) {
@@ -704,8 +781,8 @@ func (r *Replica) updateConflicts(cmds []state.Command, replica int32, instance 
 				r.conflicts[replica][cmds[i].K] = instance
 			}
 		} else {
-            r.conflicts[replica][cmds[i].K] = instance
-        }
+			r.conflicts[replica][cmds[i].K] = instance
+		}
 		if s, present := r.maxSeqPerKey[cmds[i].K]; present {
 			if s < seq {
 				r.maxSeqPerKey[cmds[i].K] = seq
@@ -798,9 +875,204 @@ func bfFromCommands(cmds []state.Command) *bloomfilter.Bloomfilter {
 
 ***********************************************************************/
 
-func (r *Replica) handlePropose(propose *genericsmr.Propose) {
-	//TODO!! Handle client retries
+// Copy k: HP#, SP#, currCount to hotMap
+func (r *Replica) copyToHotMap(k state.Key) {
 
+	_, isPresent := r.HotKeyHistory[k]
+	if isPresent {
+		r.HotKeyHistory[k].keyInSP += r.keyHistory[k].keyInSlowPath
+		r.HotKeyHistory[k].keyInHP += r.keyHistory[k].keyInHP
+	} else {
+		// create a new entry for that key not in hot map
+		hks := &hotKeySeenHelper{}
+		hks.keyInHP = r.keyHistory[k].keyInHP
+		hks.keyInSP = r.keyHistory[k].keyInSlowPath
+		hks.hotCount = 0
+		hks.prevServ = r.keyHistory[k].prevServ
+		r.HotKeyHistory[k] = hks
+	}
+
+}
+func (r *Replica) sortAndCopy() {
+	s := make(dataSlice, 0, len(r.keyHistory))
+	for _, d := range r.keyHistory {
+		s = append(s, d)
+	}
+	sort.Sort(s)
+	/*for _, d := range s {
+		// fmt.Printf("Sorted old map has %+v\n", *d)
+	}*/
+
+	full := false
+	// fmt.Println("Copy to hot map")
+	for _, d := range s {
+		for k, v := range r.keyHistory {
+			if v == d {
+				// put it in the hot map
+				r.copyToHotMap(k)
+			}
+			// if hot map has enough values : break
+			if len(r.HotKeyHistory) == NEW_SIZE {
+				full = true
+				break
+			}
+		}
+		if full {
+			break
+		}
+	}
+
+	// print hot map
+	r.printHotMap()
+
+}
+func (r *Replica) tickerReset() {
+
+	fmt.Println("RESETTINGGGGGGG")
+	// Ticker to tick every second
+	ticker := time.NewTicker(R_TIME * time.Millisecond)
+
+	// for every sec: check if map has enough elements; if yes: copy top 10
+	for _ = range ticker.C {
+		r.lockVariables.Lock()
+		// Remove key from hot list if hot count < 40% (propose count)
+		if len(r.HotKeyHistory) > 0 {
+			for k, v := range r.HotKeyHistory {
+				// if it is less than 40% of what it used to be
+				if float64(v.hotCount) < (THRESHOLD * float64(v.keyInHP)) {
+					// remove that entry from hot map
+					delete(r.HotKeyHistory, k)
+				}
+			}
+		}
+		// copy top N to hot map: If there is space left in hot map
+		if len(r.keyHistory) >= MIN_LENGTH {
+			// If there is a slot in hot map
+			if len(r.HotKeyHistory) < NEW_SIZE {
+				// 1, 2. Find top N sorted values and copy
+				//fmt.Println("Finding sorted values")
+				r.sortAndCopy()
+			}
+			// 3. Reset old map
+			//fmt.Println("Reset old map")
+			for k, _ := range r.keyHistory {
+				delete(r.keyHistory, k)
+			}
+		}
+
+		r.lockVariables.Unlock()
+	}
+
+}
+
+func (r *Replica) storeValues(proposals []*genericsmr.Propose) {
+
+	for i := 0; i < len(proposals); i++ {
+		//fmt.Println("IN HANDLE PROPOOOOOSE")
+		k := proposals[i].Command.K
+		rId := r.Replica.Id
+		//log.Println("storing server infoooooooooooooooo ", rId)
+		//fmt.Println(k)
+
+		//update Hot Key History: hot count - If key present
+		_, isPresentHot := r.HotKeyHistory[k]
+		_, isPresent := r.keyHistory[k]
+		if isPresentHot {
+			r.HotKeyHistory[k].hotCount += 1
+			// log.Println("In hot map already========== ", r.HotKeyHistory[k].hotCount)
+		} else if isPresent {
+			//update Key History: Add it
+			// Increment keyInHP value
+			r.keyHistory[k].keyInHP += 1
+			// save the server info if not saved already
+			found := false
+			for _, val := range r.keyHistory[k].prevServ {
+				if val == rId {
+					// already there
+					found = true
+					break
+				}
+			}
+			if !found {
+				r.keyHistory[k].prevServ = append(r.keyHistory[k].prevServ, rId)
+			}
+			// log.Println("Not in hot map > but in old map========== ", r.keyHistory[k].keyInHP)
+		} else {
+			// Add the key
+			// Initialize KeySeenHelper struct
+			ks := &keySeenHelper{}
+			// Set keyInHP value
+			ks.keyInHP = 1
+			// save the server
+			ks.prevServ = append(ks.prevServ, rId)
+			r.keyHistory[k] = ks
+			// log.Println("Not in both maps > New key > save it in old map ========== ", ks.keyInHP)
+		}
+	}
+
+}
+
+func (r *Replica) printHotMap() {
+	fmt.Println("---------------HOT KEYS ARE---------------------------")
+	for key, val := range r.HotKeyHistory {
+		fmt.Println(key, val.keyInSP, val.keyInHP, val.hotCount)
+	}
+}
+
+func (r *Replica) sendToServer(propose *genericsmr.Propose) {
+	var masterAddr string = ""
+	var masterPort int = 7087
+	// Call master to get replica list
+	master, err := rpc.DialHTTP("tcp", fmt.Sprintf("%s:%d", masterAddr, masterPort))
+	if err != nil {
+		log.Printf("Error connecting to master")
+	}
+	rlreply := new(masterproto.GetReplicaListReply)
+	err = master.Call("Master.GetReplicaList", new(masterproto.GetReplicaListArgs), rlreply)
+	if err != nil {
+		log.Printf("Error making the GetReplicaList RPC")
+	}
+	//N := len(rlreply.ReplicaList)
+
+	// find to which server to contact
+	toserver := (r.Id + 1) % int32(r.N)
+
+	log.Println("Trying to contact server %d from server %d", toserver, r.Id)
+
+	// call that server
+	server, er := net.Dial("tcp", rlreply.ReplicaList[toserver])
+	if er != nil {
+		log.Printf("Error connecting to replica %d\n", toserver)
+	}
+	//reader := bufio.NewReader(server)
+	writer := bufio.NewWriter(server)
+
+	// prepare Args
+	args := genericsmrproto.Propose{0 /* id */, state.Command{state.PUT, 0, 0}, 0 /* timestamp */}
+	args.CommandId = propose.CommandId
+	args.Command.K = propose.Command.K
+	args.Command.Op = propose.Command.Op
+	args.Command.V = propose.Command.V
+	// args.Timestamp = time.Now().UnixNano()
+
+	// Marshal
+	writer.WriteByte(genericsmrproto.PROPOSE)
+	args.Marshal(writer)
+	writer.Flush()
+
+	// close connection
+	server.Close()
+}
+
+func (r *Replica) keyForward(propose *genericsmr.Propose) {
+	toserver := (r.Id + 1) % int32(r.N)
+	r.SendMsg(toserver, r.forwardRPC, propose)
+
+}
+
+func (r *Replica) handlePropose(propose *genericsmr.Propose) {
+
+	// NORMAL PROCESS CONTINUES
 	batchSize := len(r.ProposeChan) + 1
 	if batchSize > MAX_BATCH {
 		batchSize = MAX_BATCH
@@ -809,8 +1081,8 @@ func (r *Replica) handlePropose(propose *genericsmr.Propose) {
 	instNo := r.crtInstance[r.Id]
 	r.crtInstance[r.Id]++
 
-	dlog.Printf("Starting instance %d\n", instNo)
-	dlog.Printf("Batching %d\n", batchSize)
+	// dlog.Printf("handle instance %d\n", instNo)
+	//dlog.Printf("Batching %d\n", batchSize)
 
 	cmds := make([]state.Command, batchSize)
 	proposals := make([]*genericsmr.Propose, batchSize)
@@ -818,11 +1090,45 @@ func (r *Replica) handlePropose(propose *genericsmr.Propose) {
 	proposals[0] = propose
 	for i := 1; i < batchSize; i++ {
 		prop := <-r.ProposeChan
+		// fmt.Printf("missing command=%v\n", prop.Command.K)
 		cmds[i] = prop.Command
 		proposals[i] = prop
 	}
 
+	//dlog.Printf("REPLICA ID = %d\n", r.Id)
+	// dlog.Printf("INSTANCE NUMBER = %d\n", instNo)
+	// dlog.Printf("NUMBER OF PROPOSALS = %d\n", len(proposals))
+	/*for i := 0; i < len(proposals); i++ {
+		dlog.Printf("PROPOSAL FOR KEY = %d\n", proposals[i].Command.K)
+	}*/
+
+	//fmt.Println("Updating Data Structures")
+	r.storeValues(proposals)
+
+	// locks
+	r.lockVariables.Lock()
+	// remove the hot proposals to stop going to phase 1
+	for i := 0; i < len(proposals); i++ {
+		// fmt.Println("HOT KEY TO CHECK FOR REMOVE = %d\n", proposals[i].Command.K)
+		_, isPresent := r.HotKeyHistory[proposals[i].Command.K]
+		if isPresent {
+			// remove it from proposals
+			//r.sendToServer(proposals[i])
+			r.keyForward(proposals[i])
+			fmt.Println("HOT KEY TO FORWARD = ", proposals[i].Command.K)
+			proposals[i] = proposals[len(proposals)-1]
+			proposals[len(proposals)-1] = nil
+			proposals = proposals[:len(proposals)-1]
+		}
+	}
+	r.lockVariables.Unlock()
+
+	/*for i := 0; i < len(proposals); i++ {
+		dlog.Printf("PROPOSAL FOR KEY AFTER TRUNCATING HOT KEYS = %d\n", proposals[i].Command.K)
+	}*/
+
 	r.startPhase1(r.Id, instNo, 0, proposals, cmds, batchSize)
+
 }
 
 func (r *Replica) startPhase1(replica int32, instance int32, ballot int32, proposals []*genericsmr.Propose, cmds []state.Command, batchSize int) {
@@ -854,7 +1160,7 @@ func (r *Replica) startPhase1(replica int32, instance int32, ballot int32, propo
 	r.recordInstanceMetadata(r.InstanceSpace[r.Id][instance])
 	r.recordCommands(cmds)
 	r.sync()
-
+	//fmt.Println("calling bcastPreAccept")
 	r.bcastPreAccept(r.Id, instance, ballot, cmds, seq, deps)
 
 	cpcounter += batchSize
@@ -989,16 +1295,17 @@ func (r *Replica) handlePreAccept(preAccept *epaxosproto.PreAccept) {
 				seq,
 				deps,
 				r.CommittedUpTo})
+
 	} else {
 		pok := &epaxosproto.PreAcceptOK{preAccept.Instance}
 		r.SendMsg(preAccept.LeaderId, r.preAcceptOKRPC, pok)
 	}
 
-	dlog.Printf("I've replied to the PreAccept\n")
+	// dlog.Printf("I've replied to the PreAccept\n")
 }
 
 func (r *Replica) handlePreAcceptReply(pareply *epaxosproto.PreAcceptReply) {
-	dlog.Printf("Handling PreAccept reply\n")
+	// dlog.Printf("Handling PreAccept reply\n")
 	inst := r.InstanceSpace[pareply.Replica][pareply.Instance]
 
 	if inst.Status != epaxosproto.PREACCEPTED {
@@ -1049,7 +1356,7 @@ func (r *Replica) handlePreAcceptReply(pareply *epaxosproto.PreAcceptReply) {
 	//can we commit on the fast path?
 	if inst.lb.preAcceptOKs >= r.N/2 && inst.lb.allEqual && allCommitted && isInitialBallot(inst.ballot) {
 		happy++
-		dlog.Printf("Fast path for instance %d.%d\n", pareply.Replica, pareply.Instance)
+		// dlog.Printf("Fast path for instance %d.%d\n", pareply.Replica, pareply.Instance)
 		r.InstanceSpace[pareply.Replica][pareply.Instance].Status = epaxosproto.COMMITTED
 		r.updateCommitted(pareply.Replica)
 		if inst.lb.clientProposals != nil && !r.Dreply {
@@ -1074,14 +1381,34 @@ func (r *Replica) handlePreAcceptReply(pareply *epaxosproto.PreAcceptReply) {
 			weird++
 		}
 		slow++
+
+		// Detecting slow path keys
+		for i := 0; i < len(inst.Cmds); i++ {
+			cmd := inst.Cmds[i]
+			// update slow path count
+			_, ispresent := r.keyHistory[cmd.K]
+			if ispresent {
+				r.keyHistory[cmd.K].keyInSlowPath += 1
+			}
+			_, isPresent := r.HotKeyHistory[cmd.K]
+			// update hot count if it is hot key
+			if isPresent {
+				r.HotKeyHistory[cmd.K].hotCount += 1
+			}
+			// log.Println("Hot Key HANDLE PRE ACCEPT REPLY ========== %d\n", cmd.K)
+		}
+		// Detecting slow path keys
+
 		inst.Status = epaxosproto.ACCEPTED
 		r.bcastAccept(pareply.Replica, pareply.Instance, inst.ballot, int32(len(inst.Cmds)), inst.Seq, inst.Deps)
+
 	}
 	//TODO: take the slow path if messages are slow to arrive
 }
 
 func (r *Replica) handlePreAcceptOK(pareply *epaxosproto.PreAcceptOK) {
-	dlog.Printf("Handling PreAccept reply\n")
+	// dlog.Printf("Handling PreAccept OK\n")
+
 	inst := r.InstanceSpace[r.Id][pareply.Instance]
 
 	if inst.Status != epaxosproto.PREACCEPTED {
@@ -1094,6 +1421,10 @@ func (r *Replica) handlePreAcceptOK(pareply *epaxosproto.PreAcceptOK) {
 	}
 
 	inst.lb.preAcceptOKs++
+
+	/*for i := 0; i < len(inst.Cmds); i++ {
+		dlog.Printf("HANDLING PREACCEPT OK FOR KEYS %d\n", inst.Cmds[i].K)
+	}*/
 
 	allCommitted := true
 	for q := 0; q < r.N; q++ {
@@ -1124,6 +1455,7 @@ func (r *Replica) handlePreAcceptOK(pareply *epaxosproto.PreAcceptOK) {
 						inst.lb.clientProposals[i].Timestamp},
 					inst.lb.clientProposals[i].Reply)
 			}
+			// dlog.Printf("OK sent to client n")
 		}
 
 		r.recordInstanceMetadata(inst)
@@ -1135,8 +1467,27 @@ func (r *Replica) handlePreAcceptOK(pareply *epaxosproto.PreAcceptOK) {
 			weird++
 		}
 		slow++
+
+		// Detecting slow path keys
+		for i := 0; i < len(inst.Cmds); i++ {
+			cmd := inst.Cmds[i]
+			// update slow path count
+			_, ispresent := r.keyHistory[cmd.K]
+			if ispresent {
+				r.keyHistory[cmd.K].keyInSlowPath += 1
+			}
+			_, isPresent := r.HotKeyHistory[cmd.K]
+			// update hot count if it is hot key
+			if isPresent {
+				r.HotKeyHistory[cmd.K].hotCount += 1
+			}
+			// log.Println("Hot Key HANDLE PRE ACCEPT OK ========== %d\n", cmd.K)
+		}
+		// Detecting slow path keys
+
 		inst.Status = epaxosproto.ACCEPTED
 		r.bcastAccept(r.Id, pareply.Instance, inst.ballot, int32(len(inst.Cmds)), inst.Seq, inst.Deps)
+
 	}
 	//TODO: take the slow path if messages are slow to arrive
 }
@@ -1202,6 +1553,7 @@ func (r *Replica) handleAccept(accept *epaxosproto.Accept) {
 }
 
 func (r *Replica) handleAcceptReply(areply *epaxosproto.AcceptReply) {
+	// dlog.Printf("Handling Accept reply\n")
 	inst := r.InstanceSpace[areply.Replica][areply.Instance]
 
 	if inst.Status != epaxosproto.ACCEPTED {
@@ -1268,9 +1620,11 @@ func (r *Replica) handleCommit(commit *epaxosproto.Commit) {
 	}
 
 	if inst != nil {
+		// dlog.Printf("instance not nil during commit")
 		if inst.lb != nil && inst.lb.clientProposals != nil && len(commit.Command) == 0 {
 			//someone committed a NO-OP, but we have proposals for this instance
 			//try in a different instance
+			//dlog.Printf("Client proposals not nil during commit, calling proposeChan")
 			for _, p := range inst.lb.clientProposals {
 				r.ProposeChan <- p
 			}
@@ -1280,6 +1634,7 @@ func (r *Replica) handleCommit(commit *epaxosproto.Commit) {
 		inst.Deps = commit.Deps
 		inst.Status = epaxosproto.COMMITTED
 	} else {
+		// dlog.Printf("instance nil during commit")
 		r.InstanceSpace[commit.Replica][int(commit.Instance)] = &Instance{
 			commit.Command,
 			0,
@@ -1316,8 +1671,10 @@ func (r *Replica) handleCommitShort(commit *epaxosproto.CommitShort) {
 	}
 
 	if inst != nil {
+		// dlog.Printf("instance not nil during commitShort")
 		if inst.lb != nil && inst.lb.clientProposals != nil {
 			//try command in a different instance
+			// dlog.Printf("Client proposals not nil during commitShort, calling proposeChan")
 			for _, p := range inst.lb.clientProposals {
 				r.ProposeChan <- p
 			}
@@ -1327,6 +1684,7 @@ func (r *Replica) handleCommitShort(commit *epaxosproto.CommitShort) {
 		inst.Deps = commit.Deps
 		inst.Status = epaxosproto.COMMITTED
 	} else {
+		// dlog.Printf("instance nil during commitShort")
 		r.InstanceSpace[commit.Replica][commit.Instance] = &Instance{
 			nil,
 			0,
